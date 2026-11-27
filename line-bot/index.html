@@ -4,8 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#06c755" />
-    <meta name="description" content="設定可在 LINE 應用程式使用的會議助理。" />
-    <title>LINE 會議助理 | 設定</title>
+    <meta name="description" content="LINE 餐廳訂位機器人與餐廳訂位管理後台。" />
+    <title>LINE 餐廳訂位 | 設定</title>
     <style>
       :root { font-family: "Microsoft JhengHei", "Noto Sans TC", sans-serif; color: #202722; background: #f3f7f4; }
       * { box-sizing: border-box; }
@@ -24,17 +24,17 @@
   <body>
     <main>
       <div class="mark" aria-hidden="true">L</div>
-      <h1>LINE 會議助理</h1>
-      <p>這是 LINE Messaging API Webhook 後端，不是網頁聊天機器人。完成部署與 LINE 設定後，就能直接在 LINE 官方帳號聊天記錄會議。</p>
+      <h1>LINE 餐廳訂位</h1>
+      <p>這是 LINE Messaging API Webhook 後端。完成部署與 LINE 設定後，顧客可在官方帳號對話完成訂位，餐廳則可登入後台查看每日訂位。</p>
       <h2>設定步驟</h2>
       <ol>
         <li>在 LINE Developers Console 建立 Messaging API Channel，取得 Channel Secret 和 Channel Access Token。</li>
-        <li>部署 <code>line-bot/server.py</code> 至支援 Python 的公開 HTTPS 主機，並設定兩個 LINE 金鑰環境變數。</li>
+        <li>部署 <code>line-bot/server.py</code> 至支援 Python 的公開 HTTPS 主機，設定 LINE 金鑰及後台帳密環境變數。</li>
         <li>在 LINE Developers Console 將 Webhook URL 設為 <code>https://你的網域/callback</code>，通過 Verify 後啟用 Use webhook。</li>
-        <li>將官方帳號加入好友，傳送「記錄會議」開始使用。</li>
+        <li>將官方帳號加入好友，傳送「訂位」開始預約。餐廳後台網址為 <code>https://你的網域/admin</code>。</li>
       </ol>
-      <p>完整部署步驟與環境變數請參閱 <a href="../README.md#設定-line-會議助理">README</a>。</p>
-      <p class="note">會議需要名稱、時間和地點；缺少欄位時 Bot 會逐項詢問。請勿把 Channel Secret 或 Access Token 放入網頁或提交至 Git。請使用持久化磁碟儲存 SQLite 資料庫。</p>
+      <p>完整部署步驟與環境變數請參閱 <a href="../README.md#設定-line-餐廳訂位">README</a>。</p>
+      <p class="note">Bot 會詢問日期、時間、人數、姓名、聯絡方式及特殊需求；每桌保留 90 分鐘，營業時間為 11:30–14:30、17:00–20:00。請勿把任何金鑰或後台密碼放入網頁或提交至 Git，並使用持久化磁碟儲存 SQLite 資料庫。</p>
     </main>
   </body>
 </html>

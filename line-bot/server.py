@@ -1,6 +1,8 @@
 import base64
+import datetime
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -10,21 +12,34 @@ import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 
-DATABASE_PATH = os.environ.get("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "meetings.db"))
+DATABASE_PATH = os.environ.get(
+    "DATABASE_PATH", os.path.join(os.path.dirname(__file__), "meetings.db")
+)
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 MAX_REQUEST_BYTES = 1024 * 1024
+DINING_MINUTES = 90
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+TABLES = tuple(
+    [f"4人桌-{number}" for number in range(1, 7)]
+    + [f"2人桌-{number}" for number in range(1, 7)]
+)
 FIELD_PATTERNS = {
-    "name": r"(?:會議名稱|名稱|名字)\s*[：:]\s*(.*?)(?=\s*(?:時間|日期|地點)\s*[：:]|$)",
-    "time": r"(?:時間|日期)\s*[：:]\s*(.*?)(?=\s*(?:會議名稱|名稱|名字|地點)\s*[：:]|$)",
-    "location": r"(?:地點|位置)\s*[：:]\s*(.*?)(?=\s*(?:會議名稱|名稱|名字|時間|日期)\s*[：:]|$)",
+    "date": r"(?:日期)\s*[：:]\s*(.*?)(?=\s*(?:時間|人數|姓名|名字|訂位人|聯絡方式|電話|手機|備註|特殊需求)\s*[：:]|$)",
+    "time": r"(?:時間)\s*[：:]\s*(.*?)(?=\s*(?:日期|人數|姓名|名字|訂位人|聯絡方式|電話|手機|備註|特殊需求)\s*[：:]|$)",
+    "party_size": r"(?:人數)\s*[：:]\s*(.*?)(?=\s*(?:日期|時間|姓名|名字|訂位人|聯絡方式|電話|手機|備註|特殊需求)\s*[：:]|$)",
+    "name": r"(?:姓名|名字|訂位人)\s*[：:]\s*(.*?)(?=\s*(?:日期|時間|人數|聯絡方式|電話|手機|備註|特殊需求)\s*[：:]|$)",
+    "contact": r"(?:聯絡方式|電話|手機)\s*[：:]\s*(.*?)(?=\s*(?:日期|時間|人數|姓名|名字|訂位人|備註|特殊需求)\s*[：:]|$)",
+    "note": r"(?:備註|特殊需求)\s*[：:]\s*(.*?)(?=\s*(?:日期|時間|人數|姓名|名字|訂位人|聯絡方式|電話|手機)\s*[：:]|$)",
 }
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-logger = logging.getLogger("line-meeting-bot")
+logger = logging.getLogger("line-restaurant-bot")
 
 
 def connect_database():
@@ -44,25 +59,31 @@ def database_session():
 
 
 def initialize_database():
-    directory = os.path.dirname(os.path.abspath(DATABASE_PATH))
-    os.makedirs(directory, exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(DATABASE_PATH)), exist_ok=True)
     with database_session() as connection:
         connection.execute(
-            """CREATE TABLE IF NOT EXISTS meetings (
+            """CREATE TABLE IF NOT EXISTS reservations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                meeting_time TEXT NOT NULL,
-                location TEXT NOT NULL,
+                line_user_id TEXT NOT NULL,
+                reservation_date TEXT NOT NULL,
+                reservation_time TEXT NOT NULL,
+                party_size INTEGER NOT NULL,
+                customer_name TEXT NOT NULL,
+                contact TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                assigned_tables TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             )"""
         )
         connection.execute(
-            """CREATE TABLE IF NOT EXISTS conversations (
-                owner_id TEXT PRIMARY KEY,
-                draft_name TEXT NOT NULL DEFAULT '',
+            """CREATE TABLE IF NOT EXISTS reservation_conversations (
+                line_user_id TEXT PRIMARY KEY,
+                draft_date TEXT NOT NULL DEFAULT '',
                 draft_time TEXT NOT NULL DEFAULT '',
-                draft_location TEXT NOT NULL DEFAULT '',
+                draft_party_size TEXT NOT NULL DEFAULT '',
+                draft_name TEXT NOT NULL DEFAULT '',
+                draft_contact TEXT NOT NULL DEFAULT '',
+                draft_note TEXT NOT NULL DEFAULT '',
                 stage TEXT NOT NULL DEFAULT ''
             )"""
         )
@@ -80,132 +101,276 @@ def parse_labeled_fields(text):
     return fields
 
 
-def get_conversation(connection, owner_id):
+def get_conversation(connection, line_user_id):
     row = connection.execute(
-        "SELECT * FROM conversations WHERE owner_id = ?", (owner_id,)
+        "SELECT * FROM reservation_conversations WHERE line_user_id = ?",
+        (line_user_id,),
     ).fetchone()
     if row:
         return dict(row)
-    return {
-        "owner_id": owner_id,
-        "draft_name": "",
-        "draft_time": "",
-        "draft_location": "",
-        "stage": "",
-    }
+    conversation = {"line_user_id": line_user_id, "stage": ""}
+    for field in ("date", "time", "party_size", "name", "contact", "note"):
+        conversation[f"draft_{field}"] = ""
+    return conversation
 
 
 def save_conversation(connection, conversation):
+    fields = ("date", "time", "party_size", "name", "contact", "note")
+    columns = ", ".join(f"draft_{field}" for field in fields)
+    values = ", ".join("?" for _ in fields)
+    updates = ", ".join(
+        f"draft_{field} = excluded.draft_{field}" for field in fields
+    )
     connection.execute(
-        """INSERT INTO conversations
-           (owner_id, draft_name, draft_time, draft_location, stage)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(owner_id) DO UPDATE SET
-             draft_name = excluded.draft_name,
-             draft_time = excluded.draft_time,
-             draft_location = excluded.draft_location,
-             stage = excluded.stage""",
+        f"""INSERT INTO reservation_conversations
+            (line_user_id, {columns}, stage) VALUES (?, {values}, ?)
+            ON CONFLICT(line_user_id) DO UPDATE SET {updates}, stage = excluded.stage""",
         (
-            conversation["owner_id"],
-            conversation["draft_name"],
-            conversation["draft_time"],
-            conversation["draft_location"],
+            conversation["line_user_id"],
+            *(conversation[f"draft_{field}"] for field in fields),
             conversation["stage"],
         ),
     )
 
 
+def reset_draft(conversation):
+    for field in ("date", "time", "party_size", "name", "contact", "note"):
+        conversation[f"draft_{field}"] = ""
+    conversation["stage"] = ""
+
+
+def validate_field(field, value):
+    if field == "date":
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return "日期格式請使用 YYYY-MM-DD，例如 2026-12-08。"
+        try:
+            parsed = datetime.date.fromisoformat(value)
+        except ValueError:
+            return "日期格式請使用 YYYY-MM-DD，例如 2026-12-08。"
+        if parsed < datetime.date.today():
+            return "不能預訂已過去的日期，請重新輸入日期。"
+    elif field == "time":
+        if not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", value):
+            return "時間格式請使用 24 小時制 HH:MM，例如 12:30。"
+    elif field == "party_size":
+        if not value.isdigit() or not 1 <= int(value) <= 24:
+            return "人數請輸入 1 到 24 的整數。"
+    elif field == "name" and not value:
+        return "請提供訂位人姓名。"
+    elif field == "contact" and not value:
+        return "請提供電話或其他聯絡方式。"
+    return ""
+
+
 def next_prompt(conversation):
-    missing = [
-        key
-        for key in ("name", "time", "location")
-        if not conversation[f"draft_{key}"]
-    ]
+    fields = ("date", "time", "party_size", "name", "contact", "note")
+    missing = [field for field in fields if not conversation[f"draft_{field}"]]
     if missing:
         field = missing[0]
         conversation["stage"] = field
         prompts = {
-            "name": "請問會議名稱是什麼？",
-            "time": "請提供會議時間，例如「明天下午 2 點」或「12/8 14:30」。",
-            "location": "請提供會議地點，例如「三樓會議室」或「Google Meet」。",
+            "date": "請提供訂位日期（YYYY-MM-DD，例如 2026-12-08）。",
+            "time": "請提供訂位時間（24 小時制 HH:MM，例如 12:30）。營業時間為 11:30–14:30、17:00–20:00。",
+            "party_size": "請問用餐人數？（1–24 人）",
+            "name": "請提供訂位人姓名。",
+            "contact": "請提供聯絡電話或其他聯絡方式。",
+            "note": "有特殊需求或備註嗎？若沒有請回覆「無」。",
         }
         return prompts[field]
 
     conversation["stage"] = "confirm"
     return (
-        "請確認會議資訊：\n"
-        f"名稱：{conversation['draft_name']}\n"
+        "請確認訂位資料：\n"
+        f"日期：{conversation['draft_date']}\n"
         f"時間：{conversation['draft_time']}\n"
-        f"地點：{conversation['draft_location']}\n\n"
-        "回覆「確認」儲存，或回覆「取消」放棄。"
+        f"人數：{conversation['draft_party_size']} 人\n"
+        f"姓名：{conversation['draft_name']}\n"
+        f"聯絡方式：{conversation['draft_contact']}\n"
+        f"備註：{conversation['draft_note'] or '無'}\n\n"
+        "回覆「確認」送出，或回覆「取消」放棄。"
     )
 
 
-def reset_draft(conversation):
-    conversation["draft_name"] = ""
-    conversation["draft_time"] = ""
-    conversation["draft_location"] = ""
-    conversation["stage"] = ""
+def reservation_interval(reservation_date, reservation_time):
+    start = datetime.datetime.combine(
+        datetime.date.fromisoformat(reservation_date),
+        datetime.time.fromisoformat(reservation_time),
+    )
+    return start, start + datetime.timedelta(minutes=DINING_MINUTES)
 
 
-def process_text(connection, owner_id, text):
+def opening_window(start, end):
+    windows = (
+        (datetime.time(11, 30), datetime.time(14, 30)),
+        (datetime.time(17, 0), datetime.time(20, 0)),
+    )
+    return any(start.time() >= opening and end.time() <= closing for opening, closing in windows)
+
+
+def available_tables(connection, reservation_date, reservation_time):
+    requested_start, requested_end = reservation_interval(
+        reservation_date, reservation_time
+    )
+    if not opening_window(requested_start, requested_end):
+        return None, 0
+
+    occupied = set()
+    overlapping_groups = 0
+    rows = connection.execute(
+        """SELECT reservation_time, assigned_tables FROM reservations
+           WHERE reservation_date = ?""",
+        (reservation_date,),
+    ).fetchall()
+    for row in rows:
+        existing_start, existing_end = reservation_interval(
+            reservation_date, row["reservation_time"]
+        )
+        if existing_start < requested_end and existing_end > requested_start:
+            occupied.update(row["assigned_tables"].split(","))
+            overlapping_groups += 1
+
+    free = [table for table in TABLES if table not in occupied]
+    return free, overlapping_groups
+
+
+def choose_tables(free_tables, party_size):
+    candidates = []
+    for count in range(1, len(free_tables) + 1):
+        for selection in itertools.combinations(free_tables, count):
+            seats = sum(4 if table.startswith("4人桌") else 2 for table in selection)
+            if seats >= party_size:
+                candidates.append((count, seats - party_size, selection))
+        if candidates:
+            break
+    if not candidates:
+        return None
+    return min(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
+
+
+def create_reservation(connection, line_user_id, conversation):
+    reservation_date = conversation["draft_date"]
+    reservation_time = conversation["draft_time"]
+    free_tables, overlapping_groups = available_tables(
+        connection, reservation_date, reservation_time
+    )
+    if free_tables is None:
+        conversation["draft_time"] = ""
+        conversation["stage"] = "time"
+        save_conversation(connection, conversation)
+        return (
+            "這個時間不在營業時段內，或 90 分鐘用餐時間會超過打烊時間。"
+            "請直接輸入其他時間；可選 11:30–13:00 或 17:00–18:30。"
+        )
+
+    assigned = choose_tables(free_tables, int(conversation["draft_party_size"]))
+    if not assigned:
+        wait_minutes = max(10, ((overlapping_groups + 1) // 2) * 10)
+        conversation["draft_time"] = ""
+        conversation["stage"] = "time"
+        save_conversation(connection, conversation)
+        return (
+            f"很抱歉，{reservation_time} 的桌位不足，依目前同時段訂位組數，"
+            f"預估需等候約 {wait_minutes} 分鐘（每 2 組約增加 10 分鐘）。\n"
+            "尚未替您保留座位，請直接輸入其他時間再試。"
+        )
+
+    connection.execute(
+        """INSERT INTO reservations
+           (line_user_id, reservation_date, reservation_time, party_size,
+            customer_name, contact, note, assigned_tables, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            line_user_id,
+            reservation_date,
+            reservation_time,
+            int(conversation["draft_party_size"]),
+            conversation["draft_name"],
+            conversation["draft_contact"],
+            conversation["draft_note"],
+            ",".join(assigned),
+            int(time.time()),
+        ),
+    )
+    table_description = "、".join(assigned)
+    party_size = int(conversation["draft_party_size"])
+    reset_draft(conversation)
+    save_conversation(connection, conversation)
+    return (
+        f"訂位成功！{reservation_date} {reservation_time}，{party_size} 人，"
+        f"安排座位：{table_description}。"
+    )
+
+
+def process_text(connection, line_user_id, text):
     message = text.strip()
-    conversation = get_conversation(connection, owner_id)
+    conversation = get_conversation(connection, line_user_id)
 
-    if message in ("取消", "取消記錄"):
+    if message in ("取消", "取消訂位"):
         reset_draft(conversation)
         save_conversation(connection, conversation)
-        return "已取消，沒有儲存會議。"
+        return "已取消，沒有送出訂位。"
 
-    if message in ("顯示會議", "我的會議", "列出會議"):
+    if message in ("訂位", "我要訂位", "開始訂位"):
+        reset_draft(conversation)
+        conversation["stage"] = "date"
+        save_conversation(connection, conversation)
+        return next_prompt(conversation)
+
+    if message == "我的訂位":
         rows = connection.execute(
-            """SELECT name, meeting_time, location FROM meetings
-               WHERE owner_id = ? ORDER BY id DESC LIMIT 10""",
-            (owner_id,),
+            """SELECT reservation_date, reservation_time, party_size,
+                      customer_name, assigned_tables
+               FROM reservations WHERE line_user_id = ?
+               ORDER BY reservation_date, reservation_time LIMIT 10""",
+            (line_user_id,),
         ).fetchall()
         if not rows:
-            return "目前沒有已記錄的會議。傳送「記錄會議」即可新增。"
-        lines = [
-            f"{index}. {row['name']}｜{row['meeting_time']}｜{row['location']}"
-            for index, row in enumerate(rows, start=1)
-        ]
-        return "最近的會議：\n" + "\n".join(lines)
-
-    if message in ("確認", "儲存") and conversation["stage"] == "confirm":
-        connection.execute(
-            """INSERT INTO meetings (owner_id, name, meeting_time, location, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-                owner_id,
-                conversation["draft_name"],
-                conversation["draft_time"],
-                conversation["draft_location"],
-                int(time.time()),
-            ),
+            return "目前沒有您的訂位紀錄。傳送「訂位」即可開始預約。"
+        return "您的訂位：\n" + "\n".join(
+            f"{row['reservation_date']} {row['reservation_time']}｜"
+            f"{row['party_size']} 人｜{row['customer_name']}｜{row['assigned_tables']}"
+            for row in rows
         )
-        meeting_name = conversation["draft_name"]
-        reset_draft(conversation)
-        save_conversation(connection, conversation)
-        return f"已記錄會議「{meeting_name}」。"
 
-    start_command = re.match(r"^記錄會議(?:\s|[：:，,]|$)(.*)$", message)
+    start_command = re.match(r"^(?:訂位|我要訂位)\s+(.+)$", message)
     if start_command:
         reset_draft(conversation)
-        details = start_command.group(1).strip(" ：:,，")
-    elif conversation["stage"]:
-        details = message
+        conversation["stage"] = "date"
+        details = start_command.group(1)
     else:
-        return "我可以幫你記錄會議。傳送「記錄會議」，再提供名稱、時間和地點。"
+        details = message
+
+    if message in ("確認", "送出") and conversation["stage"] == "confirm":
+        error = validate_field("date", conversation["draft_date"])
+        if not error:
+            error = validate_field("time", conversation["draft_time"])
+        if error:
+            return error
+        return create_reservation(connection, line_user_id, conversation)
+
+    if conversation["stage"] not in (
+        "date", "time", "party_size", "name", "contact", "note", "confirm"
+    ):
+        return "歡迎使用餐廳訂位服務！傳送「訂位」開始預約，或傳送「我的訂位」查詢。"
+
+    if not start_command and conversation["stage"] == "confirm":
+        return "請回覆「確認」送出訂位，或回覆「取消」放棄。"
 
     fields = parse_labeled_fields(details)
-    for field, value in fields.items():
-        if value:
-            conversation[f"draft_{field}"] = value
+    if fields:
+        updates = fields
+    else:
+        updates = {conversation["stage"]: message}
 
-    if conversation["stage"] in ("name", "time", "location") and not fields:
-        field = conversation["stage"]
-        conversation[f"draft_{field}"] = message
-
+    for field, value in updates.items():
+        if field == "note" and value in ("無", "沒有", "不用"):
+            conversation["draft_note"] = "無"
+            continue
+        error = validate_field(field, value)
+        if error:
+            save_conversation(connection, conversation)
+            return error
+        conversation[f"draft_{field}"] = value
     response = next_prompt(conversation)
     save_conversation(connection, conversation)
     return response
@@ -247,12 +412,71 @@ def reply_to_line(reply_token, text):
         raise RuntimeError("Could not reach the LINE reply API") from error
 
 
+def admin_authorized(headers):
+    if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+        return False
+    value = headers.get("Authorization", "")
+    if not value.startswith("Basic "):
+        return False
+    try:
+        username, password = base64.b64decode(value[6:], validate=True).decode(
+            "utf-8"
+        ).split(":", 1)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return hmac.compare_digest(username, ADMIN_USERNAME) and hmac.compare_digest(
+        password, ADMIN_PASSWORD
+    )
+
+
+def get_admin_data(reservation_date):
+    with database_session() as connection:
+        rows = connection.execute(
+            """SELECT id, reservation_date, reservation_time, party_size,
+                      customer_name, contact, note, assigned_tables
+               FROM reservations WHERE reservation_date = ?
+               ORDER BY reservation_time, id""",
+            (reservation_date,),
+        ).fetchall()
+    reservations = [dict(row) for row in rows]
+    return {
+        "date": reservation_date,
+        "total_people": sum(row["party_size"] for row in reservations),
+        "reservation_count": len(reservations),
+        "reservations": reservations,
+    }
+
+
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path != "/health":
-            self.send_error(404)
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
+            self.respond(200, b"ok", "text/plain; charset=utf-8")
             return
-        self.respond(200, b"ok")
+        if parsed.path in ("/", "/index.html"):
+            self.serve_file("index.html")
+            return
+        if parsed.path in ("/admin", "/admin.html", "/api/reservations"):
+            if not admin_authorized(self.headers):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="Restaurant admin"')
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path == "/api/reservations":
+                date_value = parse_qs(parsed.query).get(
+                    "date", [datetime.date.today().isoformat()]
+                )[0]
+                try:
+                    datetime.date.fromisoformat(date_value)
+                except ValueError:
+                    self.respond_json(400, {"error": "date must use YYYY-MM-DD"})
+                    return
+                self.respond_json(200, get_admin_data(date_value))
+                return
+            self.serve_file("admin.html")
+            return
+        self.send_error(404)
 
     def do_POST(self):
         if self.path != "/callback":
@@ -284,18 +508,17 @@ class WebhookHandler(BaseHTTPRequestHandler):
             logger.exception("Failed to process LINE webhook event")
             self.send_error(500)
             return
-        self.respond(200, b"ok")
+        self.respond(200, b"ok", "text/plain; charset=utf-8")
 
     def handle_event(self, event):
         if event.get("type") != "message" or event.get("message", {}).get("type") != "text":
             return
         reply_token = event.get("replyToken")
-        source = event.get("source", {})
-        owner_id = source.get("userId")
+        line_user_id = event.get("source", {}).get("userId")
         if not reply_token:
             return
-        if not owner_id:
-            reply_to_line(reply_token, "請先將我加入好友，再使用會議記錄功能。")
+        if not line_user_id:
+            reply_to_line(reply_token, "請先將我加入好友，再使用餐廳訂位服務。")
             return
 
         event_id = event.get("webhookEventId")
@@ -309,12 +532,30 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     )
                 except sqlite3.IntegrityError:
                     return
-            response_text = process_text(connection, owner_id, event["message"]["text"])
+            response_text = process_text(
+                connection, line_user_id, event["message"]["text"]
+            )
         reply_to_line(reply_token, response_text)
 
-    def respond(self, status, body):
+    def serve_file(self, filename):
+        path = os.path.join(os.path.dirname(__file__), filename)
+        try:
+            with open(path, "rb") as file:
+                content = file.read()
+        except OSError:
+            logger.exception("Could not read web file %s", filename)
+            self.send_error(500)
+            return
+        self.respond(200, content, "text/html; charset=utf-8")
+
+    def respond_json(self, status, data):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.respond(status, body, "application/json; charset=utf-8")
+
+    def respond(self, status, body, content_type):
         self.send_response(status)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -327,7 +568,7 @@ def main():
     initialize_database()
     port = int(os.environ.get("PORT", "8080"))
     server = ThreadingHTTPServer(("0.0.0.0", port), WebhookHandler)
-    logger.info("LINE meeting bot listening on port %s", port)
+    logger.info("LINE restaurant bot listening on port %s", port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
